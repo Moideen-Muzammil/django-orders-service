@@ -1,0 +1,66 @@
+name: deploy
+
+# Reusable workflow: one deploy definition, called once per environment
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # holds per-env vars + approval rules
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (deploy identity, separate from CI identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install orders-service helm/orders-service \
+            --namespace ${{ inputs.environment }} --create-namespace \
+            -f helm/orders-service/values-${{ inputs.environment }}.yaml \
+            --set image.repository=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/orders-service \
+            --set image.tag=${{ inputs.image_tag }} \
+            --atomic --wait --timeout 5m \
+            --history-max 10
+
+      - name: Smoke test (auto-rollback on failure)
+        run: |
+          NS=${{ inputs.environment }}
+          if ! kubectl run smoke-$GITHUB_RUN_ID -n $NS --rm -i --restart=Never \
+               --image=curlimages/curl:8.10.1 --command -- \
+               curl -fsS --retry 5 --retry-delay 3 http://orders-service/orders; then
+            echo "Smoke test failed: rolling back"
+            helm rollback orders-service -n $NS --wait --timeout 5m
+            exit 1
+          fi
+
+      - name: Show result
+        if: always()
+        run: |
+          helm history orders-service -n ${{ inputs.environment }} || true
+          kubectl get pods -n ${{ inputs.environment }} -l app.kubernetes.io/instance=orders-service || true

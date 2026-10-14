@@ -1,0 +1,6 @@
+replicaCount: 1
+pdb:
+  enabled: false
+env:
+  APP_ENV: dev
+  ALLOWED_HOSTS: "localhost,127.0.0.1,orders-service,orders-service.dev.svc.cluster.local"

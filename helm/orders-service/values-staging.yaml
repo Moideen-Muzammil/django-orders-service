@@ -1,0 +1,4 @@
+replicaCount: 2
+env:
+  APP_ENV: staging
+  ALLOWED_HOSTS: "localhost,127.0.0.1,orders-service,orders-service.staging.svc.cluster.local"

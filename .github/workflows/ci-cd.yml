@@ -1,0 +1,148 @@
+name: ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One run per branch; new PR pushes cancel old runs, but never cancel a main deploy midway
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default; jobs elevate only what they need
+permissions:
+  contents: read
+
+env:
+  SERVICE_NAME: orders-service
+
+jobs:
+  # ---------- CI ----------
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-test-only-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        run: python manage.py test
+
+  code-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan dependencies and secrets in source
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint chart and render it for every environment
+        run: |
+          helm lint helm/orders-service --set image.repository=x --set image.tag=x
+          for env in dev staging prod; do
+            helm template orders-service helm/orders-service \
+              -f helm/orders-service/values-$env.yaml \
+              --set image.repository=x --set image.tag=x > /dev/null
+          done
+
+  build:
+    needs: [test, code-scan, helm-lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # needed to request the OIDC token for GCP
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/${SERVICE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build locally (no push) so we can scan BEFORE anything reaches the registry
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # Everything below runs only on merge to main, not on PRs
+      - name: Authenticate to GCP (Workload Identity Federation, no keys)
+        if: github.ref == 'refs/heads/main'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.CI_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        if: github.ref == 'refs/heads/main'
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: docker push ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+  # ---------- CD ----------
+  deploy-dev:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: dev
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    permissions:
+      contents: read
+      id-token: write
+
+  deploy-staging:
+    needs: [build, deploy-dev]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    permissions:
+      contents: read
+      id-token: write
+
+  deploy-prod:
+    needs: [build, deploy-staging]
+    uses: ./.github/workflows/deploy.yml   # the "prod" GitHub Environment requires manual approval
+    with:
+      environment: prod
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    permissions:
+      contents: read
+      id-token: write

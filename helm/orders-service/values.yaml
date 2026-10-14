@@ -1,0 +1,42 @@
+# Defaults shared by every environment. Per-env files override these.
+replicaCount: 2
+
+image:
+  repository: ""        # injected by CI
+  tag: ""               # injected by CI (git SHA), never "latest"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: orders-service
+  annotations: {}       # later: iam.gke.io/gcp-service-account for Workload Identity
+
+service:
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# Kubernetes Secret holding Django's SECRET_KEY. Created out-of-band (see README);
+# secret VALUES never go in Git or Helm values.
+secret:
+  name: orders-secret
+  key: SECRET_KEY
+
+env:
+  LOG_LEVEL: INFO
