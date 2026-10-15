@@ -45,7 +45,7 @@ jobs:
             -f helm/orders-service/values-${{ inputs.environment }}.yaml \
             --set image.repository=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/orders-service \
             --set image.tag=${{ inputs.image_tag }} \
-            --atomic --wait --timeout 5m \
+            --rollback-on-failure --force-conflicts --wait --timeout 5m \
             --history-max 10
 
       - name: Smoke test (auto-rollback on failure)
